@@ -106,6 +106,7 @@ struct CaptureConfig {
     var outputDirectory = URL(fileURLWithPath: "captures")
     var pageDelay = 0.8
     var selfTimer = 0.0
+    var countdownSound = defaultCountdownSoundName()
     var key = PageTurnKey.pageDown
     var prefix = "page"
     var windowTitle: String?
@@ -194,6 +195,8 @@ func parseArguments(_ arguments: [String]) throws -> CaptureConfig {
                 throw CaptureError.usage("--self-timer must be zero or greater.")
             }
             config.selfTimer = value
+        case "--countdown-sound":
+            config.countdownSound = try requireValue(for: argument)
         case "--key":
             config.key = try PageTurnKey(argument: try requireValue(for: argument))
         case "--app-name":
@@ -545,6 +548,79 @@ func filename(prefix: String, index: Int) -> String {
     "\(prefix)-\(String(format: "%04d", index)).png"
 }
 
+let noCountdownSoundName = "None"
+
+let preferredCountdownSoundNames = [
+    "Pop",
+    "Glass",
+    "Ping",
+    "Bottle",
+    "Tink",
+    "Hero",
+    "Sosumi",
+    "Purr",
+    "Blow",
+    "Morse",
+    "Funk",
+    "Basso",
+    "Submarine",
+    "Frog"
+]
+
+func availableCountdownSoundNames() -> [String] {
+    let soundDirectory = URL(fileURLWithPath: "/System/Library/Sounds", isDirectory: true)
+    let discoveredNames = (try? FileManager.default.contentsOfDirectory(
+        at: soundDirectory,
+        includingPropertiesForKeys: nil
+    ))?
+        .filter { $0.pathExtension.caseInsensitiveCompare("aiff") == .orderedSame }
+        .map { $0.deletingPathExtension().lastPathComponent } ?? []
+
+    let discoveredSet = Set(discoveredNames)
+    let preferredNames = preferredCountdownSoundNames.filter { discoveredSet.contains($0) }
+    let extraNames = discoveredSet.subtracting(preferredNames).sorted()
+    return [noCountdownSoundName] + preferredNames + extraNames
+}
+
+func defaultCountdownSoundName() -> String {
+    noCountdownSoundName
+}
+
+func normalizedCountdownSoundName(_ soundName: String) -> String {
+    soundName
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .replacingOccurrences(of: ".aiff", with: "", options: [.caseInsensitive])
+}
+
+func isNoCountdownSoundName(_ soundName: String) -> Bool {
+    let normalizedName = normalizedCountdownSoundName(soundName).lowercased()
+    return normalizedName.isEmpty || ["none", "off", "silent", "mute", "muted"].contains(normalizedName)
+}
+
+func countdownSoundPath(named soundName: String) -> String? {
+    let trimmedName = normalizedCountdownSoundName(soundName)
+
+    guard !isNoCountdownSoundName(trimmedName) else {
+        return nil
+    }
+
+    let names = availableCountdownSoundNames()
+    let resolvedName = names.first { $0.caseInsensitiveCompare(trimmedName) == .orderedSame } ?? trimmedName
+    let soundPath = "/System/Library/Sounds/\(resolvedName).aiff"
+    guard FileManager.default.fileExists(atPath: soundPath) else {
+        return nil
+    }
+
+    return soundPath
+}
+
+func playCountdownSound(named soundName: String) {
+    guard let soundPath = countdownSoundPath(named: soundName) else {
+        return
+    }
+    _ = try? runProcess("/usr/bin/afplay", [soundPath])
+}
+
 struct ImageFingerprint {
     let samples: [UInt8]
 
@@ -606,29 +682,38 @@ func imageFingerprint(for url: URL) throws -> ImageFingerprint {
     return ImageFingerprint(samples: samples)
 }
 
-func runSelfTimer(seconds: Double, dryRun: Bool) {
+func runSelfTimer(seconds: Double, soundName: String, dryRun: Bool) {
     guard seconds > 0 else {
         return
     }
 
     if dryRun {
-        print("dry-run: self-timer \(seconds) second(s)")
+        print("dry-run: self-timer \(seconds) second(s), countdown sound \(soundName)")
         return
     }
 
-    let wholeSeconds = Int(seconds.rounded(.down))
-    let fractionalSeconds = seconds - Double(wholeSeconds)
+    let countdownSeconds = min(3, Int(seconds.rounded(.down)))
+    let leadSeconds = seconds - Double(countdownSeconds)
 
-    if wholeSeconds > 0 {
-        print("Self-timer: \(wholeSeconds) second(s)")
-        for remaining in stride(from: wholeSeconds, through: 1, by: -1) {
-            print("\(remaining)...")
-            Thread.sleep(forTimeInterval: 1)
-        }
+    print("Self-timer: \(String(format: "%.1f", seconds)) second(s)")
+    fflush(stdout)
+
+    if leadSeconds > 0 {
+        Thread.sleep(forTimeInterval: leadSeconds)
     }
 
-    if fractionalSeconds > 0 {
-        Thread.sleep(forTimeInterval: fractionalSeconds)
+    if countdownSeconds > 0 {
+        for remaining in stride(from: countdownSeconds, through: 1, by: -1) {
+            let tickStartedAt = Date()
+            print("\(remaining)...")
+            fflush(stdout)
+            playCountdownSound(named: soundName)
+
+            let elapsed = Date().timeIntervalSince(tickStartedAt)
+            if elapsed < 1 {
+                Thread.sleep(forTimeInterval: 1 - elapsed)
+            }
+        }
     }
 }
 
@@ -671,7 +756,7 @@ func runCapture(_ config: CaptureConfig) throws {
     } else {
         print("Capturing \(config.count) page(s) from window \(window.id) to \(outputDirectory.path)")
     }
-    runSelfTimer(seconds: config.selfTimer, dryRun: config.dryRun)
+    runSelfTimer(seconds: config.selfTimer, soundName: config.countdownSound, dryRun: config.dryRun)
 
     let iterationLimit = config.captureUntilEnd && config.dryRun ? min(config.count, 3) : config.count
     if config.captureUntilEnd && config.dryRun && iterationLimit < config.count {
@@ -781,9 +866,12 @@ final class CaptureViewModel: ObservableObject {
     @Published var captureUntilEnd = false
     @Published var delay = 0.8
     @Published var selfTimer = 3.0
+    @Published var countdownSound = defaultCountdownSoundName()
     @Published var key = PageTurnKey.pageDown
     @Published var log = ""
     @Published var isRunning = false
+
+    let countdownSoundNames = availableCountdownSoundNames()
 
     private var process: Process?
     private var pollTimer: Timer?
@@ -816,6 +904,13 @@ final class CaptureViewModel: ObservableObject {
         NSWorkspace.shared.open(URL(fileURLWithPath: outputDirectory, isDirectory: true))
     }
 
+    func previewCountdownSound() {
+        let soundName = countdownSound
+        Task.detached {
+            playCountdownSound(named: soundName)
+        }
+    }
+
     func listWindows() {
         runInternalCommand(extraArguments: ["--list-windows"], clearLog: true)
     }
@@ -845,6 +940,7 @@ final class CaptureViewModel: ObservableObject {
             "--output-dir", outputDirectory,
             "--delay", String(delay),
             "--self-timer", String(selfTimer),
+            "--countdown-sound", countdownSound,
             "--key", key.rawValue,
             "--prefix", prefix.isEmpty ? "page" : prefix
         ]
@@ -998,6 +1094,14 @@ final class CaptureViewModel: ObservableObject {
         process = nil
         appendLog("\nFinished with exit status \(status).\n")
         cleanupCommandFiles()
+        activateMainWindow()
+    }
+
+    private func activateMainWindow() {
+        if let window = NSApp.windows.first(where: { $0.isVisible }) {
+            window.makeKeyAndOrderFront(nil)
+        }
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func appendNewText(from url: URL, offset: inout UInt64, toStandardError: Bool) {
@@ -1200,6 +1304,24 @@ struct CaptureAppView: View {
                                 .monospacedDigit()
                                 .frame(width: 48, alignment: .trailing)
                         }
+
+                        HStack(spacing: 8) {
+                            Text("Sound")
+                                .frame(width: 108, alignment: .leading)
+                            Picker("", selection: $model.countdownSound) {
+                                ForEach(model.countdownSoundNames, id: \.self) { soundName in
+                                    Text(soundName).tag(soundName)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .frame(width: 160, alignment: .leading)
+                            Button(action: model.previewCountdownSound) {
+                                Label("Preview", systemImage: "speaker.wave.2")
+                            }
+                            .disabled(model.isRunning || isNoCountdownSoundName(model.countdownSound))
+                            Spacer()
+                        }
                     }
                     .padding(.top, 2)
                 }
@@ -1239,9 +1361,10 @@ struct CaptureAppView: View {
 
 final class CaptureAppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
-    private var quitEventMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        installMainMenu()
+
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 760, height: 720),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -1254,23 +1377,26 @@ final class CaptureAppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         self.window = window
 
-        quitEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            if flags.contains(.control),
-               event.charactersIgnoringModifiers?.lowercased() == "q" {
-                NSApp.terminate(nil)
-                return nil
-            }
-            return event
-        }
-
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        if let quitEventMonitor {
-            NSEvent.removeMonitor(quitEventMonitor)
-        }
+    @MainActor
+    private func installMainMenu() {
+        let mainMenu = NSMenu()
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        let quitItem = NSMenuItem(
+            title: "Quit Ebook Capture",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+
+        quitItem.keyEquivalentModifierMask = [.command]
+        quitItem.target = NSApp
+        appMenu.addItem(quitItem)
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+        NSApp.mainMenu = mainMenu
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
